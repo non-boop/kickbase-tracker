@@ -7,6 +7,13 @@ as repo secrets. Never logs the password; on any failure it still writes
 a JSON file (with an "error" field) so the workflow's commit step has
 something to push and the dashboard can show a clear "last run failed"
 state instead of silently going stale.
+
+v1.1: several endpoint/field guesses from the community docs didn't
+fully pan out on the first live run (own budget, other managers, team
+names, and league-wide movers all came back empty or squad-only). Rather
+than keep guessing blind, this version also writes a "diag" block into
+the output with the *real* shapes Kickbase returned (key names, one
+sample raw player) so the next fix can be exact instead of another guess.
 """
 import json
 import os
@@ -36,13 +43,23 @@ def safe(fn, *args, default=None, label=""):
         return default
 
 
+def shape(x, sample_len=1):
+    """Small, JSON-safe summary of an API response for diagnostics:
+    its type, top-level keys (if a dict) or length (if a list), and one
+    raw sample item so we can see real field names without dumping
+    everything."""
+    if isinstance(x, dict):
+        return {"type": "dict", "keys": list(x.keys())}
+    if isinstance(x, list):
+        return {"type": "list", "len": len(x), "sample": x[:sample_len]}
+    return {"type": type(x).__name__, "value": x}
+
+
 def team_value_and_reserves(squad_raw):
     players_raw = find_list(squad_raw, "it", "players", "squad")
     players = [player_from(p) for p in players_raw]
     players = [p for p in players if p]
     team_value = sum(p["market_value"] or 0 for p in players)
-    # total_gain (mvgl) is Kickbase's own "gain since you bought this
-    # player" figure when present; fall back to mv - buy_price.
     reserves = 0
     for p in players:
         if p["total_gain"] is not None:
@@ -60,6 +77,7 @@ def main():
         "ok": False,
         "error": None,
     }
+    diag = {}
 
     if not email or not password:
         result["error"] = "KICK_EMAIL / KICK_PASSWORD not set"
@@ -69,11 +87,13 @@ def main():
     try:
         token, login_data = kb.login(email, password)
         log("login ok")
+        diag["login_shape"] = shape(login_data)
 
         leagues = kb.get_leagues(token)
         if not leagues:
             raise kb.KickbaseError("no leagues returned for this account")
         league_raw = leagues[0]
+        diag["league_raw_sample"] = league_raw
         league_id = pick(league_raw, "i", "id", "leagueId")
         league_name = pick(league_raw, "n", "name")
         if not league_id:
@@ -81,20 +101,40 @@ def main():
         log(f"league: {league_name} ({league_id})")
 
         me_raw = safe(kb.get_me, token, default={}, label="get_me")
+        diag["me_raw"] = me_raw
         my_id = pick(me_raw, "id", "i", "userId") or pick(login_data, "id", "i")
+        if not my_id:
+            for k in ("u", "user"):
+                inner = login_data.get(k) if isinstance(login_data, dict) else None
+                if isinstance(inner, dict):
+                    my_id = pick(inner, "id", "i", "userId")
+                    if my_id:
+                        break
+        # the league membership entry itself often carries our own id too
+        if not my_id:
+            my_id = pick(league_raw, "uid", "userId")
+        diag["my_id_resolved"] = my_id
 
         # --- market (buyable players) ---
         market_raw = safe(kb.get_market, token, league_id, default={}, label="get_market")
+        diag["market_raw_shape"] = shape(market_raw)
         market_players_raw = find_list(market_raw, "it", "market", "players")
+        if market_players_raw:
+            diag["market_player_raw_sample"] = market_players_raw[0]
         market_players = [player_from(p) for p in market_players_raw]
         market_players = [p for p in market_players if p]
         log(f"market players: {len(market_players)}")
 
         # --- my squad + budget ---
         my_squad_raw = safe(kb.get_squad, token, league_id, default={}, label="get_squad")
+        diag["squad_raw_shape"] = shape(my_squad_raw)
+        squad_players_raw = find_list(my_squad_raw, "it", "players", "squad")
+        if squad_players_raw:
+            diag["squad_player_raw_sample"] = squad_players_raw[0]
         my_team_value, my_reserves, my_players = team_value_and_reserves(my_squad_raw)
 
         my_dashboard = safe(kb.get_manager_dashboard, token, league_id, my_id, default={}, label="get_manager_dashboard") if my_id else {}
+        diag["my_dashboard_raw"] = my_dashboard
         my_actual_budget = pick(my_dashboard, *FIELD["budget"])
 
         calib = bud.calibrate(my_team_value, 0, my_reserves, my_actual_budget, LEAGUE_RULES)
@@ -102,7 +142,10 @@ def main():
 
         # --- other managers ---
         ranking_raw = safe(kb.get_ranking, token, league_id, default={}, label="get_ranking")
+        diag["ranking_raw_shape"] = shape(ranking_raw)
         ranking_list = find_list(ranking_raw, "us", "users", "managers", "it")
+        if ranking_list:
+            diag["ranking_entry_sample"] = ranking_list[0]
         managers = []
         for m in ranking_list:
             uid = pick(m, *FIELD["user_id"])
@@ -131,8 +174,22 @@ def main():
         log(f"managers: {len(managers)}")
 
         activities_raw = safe(kb.get_activities_feed, token, league_id, default=None, label="get_activities_feed")
+        if isinstance(activities_raw, (dict, list)):
+            diag["activities_raw_shape"] = shape(activities_raw)
+            feed_list = find_list(activities_raw, "af", "items", "feed", "it")
+            if feed_list:
+                diag["activities_entry_sample"] = feed_list[0]
 
-        # --- top gainers / losers across everything we could see (market + all squads) ---
+        # --- top gainers / losers ---
+        # NOTE: on the first live run, only squad players carried day/week
+        # delta fields - the market endpoint's player objects didn't. So
+        # right now this is effectively "movers among your own squad",
+        # not the whole competition. diag["market_player_raw_sample"]
+        # above will show whether Kickbase exposes deltas there under a
+        # different key, or whether we need a different endpoint
+        # (e.g. a full competition player list) for true league-wide
+        # gainers/losers - flagged clearly so it isn't mistaken for the
+        # full picture in the meantime.
         all_seen = {p["id"]: p for p in market_players if p.get("id")}
         for p in my_players:
             if p.get("id"):
@@ -140,6 +197,7 @@ def main():
         movers = [p for p in all_seen.values() if p.get("day_delta") is not None]
         gainers = sorted(movers, key=lambda p: p["day_delta"], reverse=True)[:20]
         losers = sorted(movers, key=lambda p: p["day_delta"])[:20]
+        movers_scope = "squad_only" if not any(p.get("day_delta") is not None for p in market_players) else "market+squad"
 
         # --- buy recommendations: value momentum + underpriced + affordable ---
         buyable = [p for p in market_players if p.get("price")]
@@ -151,7 +209,7 @@ def main():
             momentum += 0.5 * ((p.get("week_delta") or 0) / max_day)
             ppm = 0.0
             if p.get("average") and p.get("price"):
-                ppm = (p["average"] / (p["price"] / 1_000_000.0))  # avg points per million
+                ppm = (p["average"] / (p["price"] / 1_000_000.0))
             return momentum, ppm
 
         for p in buyable:
@@ -178,6 +236,7 @@ def main():
             "budget_calibration": calib,
             "gainers": gainers,
             "losers": losers,
+            "movers_scope": movers_scope,
             "buy_recommendations": recommendations,
             "managers": sorted(managers, key=lambda m: (m["estimated_budget"] is None, -(m["estimated_budget"] or 0))),
             "debug": {
@@ -186,11 +245,13 @@ def main():
                 "manager_count": len(managers),
                 "has_activities_feed": activities_raw is not None,
             },
+            "diag": diag,
         })
     except Exception as e:
         log("FATAL:", e)
         log(traceback.format_exc())
         result["error"] = str(e)
+        result["diag"] = diag
 
     write(result)
     if not result["ok"]:
@@ -200,7 +261,7 @@ def main():
 def write(result):
     os.makedirs(os.path.dirname(OUT_PATH), exist_ok=True)
     with open(OUT_PATH, "w") as f:
-        json.dump(result, f, indent=2, ensure_ascii=False)
+        json.dump(result, f, indent=2, ensure_ascii=False, default=str)
     log(f"wrote {OUT_PATH}")
 
 

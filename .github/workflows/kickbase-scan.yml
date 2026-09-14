@@ -32,7 +32,18 @@ jobs:
         run: |
           git config user.name "kickbase-scan-bot"
           git config user.email "actions@users.noreply.github.com"
+          # The repo may have moved on (e.g. a manual push) since this
+          # run's checkout. Re-base our branch pointer onto the latest
+          # main first - this only moves HEAD/index, it does NOT touch
+          # the working tree, so the freshly-generated data/latest.json
+          # sitting uncommitted on disk is preserved and simply gets
+          # committed on top of the up-to-date branch.
+          git fetch origin main
+          git reset origin/main
           git add data/latest.json
-          git diff --staged --quiet && echo "no changes" && exit 0
+          if git diff --staged --quiet; then
+            echo "no changes"
+            exit 0
+          fi
           git commit -m "Update Kickbase scan results [skip ci]"
-          git push
+          git push origin HEAD:main
